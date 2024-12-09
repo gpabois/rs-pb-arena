@@ -6,5 +6,5 @@ license-file = "LICENSE.txt"
 description = "Yet another arena allocator for graph based operations"
 keywords = ["arena", "id-based arena", "tree", "graph"]
 categories = ["memory-management"]
-homepage = "https://github.com/gpabois/pb-arena"
+homepage = "https://github.com/gpabois/rs-pb-arena"
 [dependencies]
