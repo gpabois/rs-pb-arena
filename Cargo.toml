@@ -1,6 +1,6 @@
 [package]
 name = "pb-arena"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license-file = "LICENSE.txt"
 description = "Yet another arena allocator for graph based operations"

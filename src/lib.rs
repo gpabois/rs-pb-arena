@@ -107,7 +107,7 @@ pub struct ArenaBlock<T: Sized> {
     layout: Layout
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ArenaCellId(usize);
 
 impl From<usize> for ArenaCellId {
@@ -116,7 +116,7 @@ impl From<usize> for ArenaCellId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ArenaBlockId(usize);
 
 impl From<usize> for ArenaBlockId {
@@ -125,10 +125,20 @@ impl From<usize> for ArenaBlockId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ArenaId {
     block_id: ArenaBlockId,
     cell_id: ArenaCellId
+}
+
+impl Ord for ArenaId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.block_id != other.block_id {
+            return self.block_id.cmp(&other.block_id);
+        }
+
+        return self.cell_id.cmp(&other.cell_id);
+    }
 }
 
 impl ArenaId {
