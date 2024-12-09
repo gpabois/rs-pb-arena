@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE.txt"
 description = "Yet another arena allocator for graph based operations"
-keywords = ["arena", "id-based arena", "tree", "graph"]
+keywords = ["arena", "tree", "graph"]
 categories = ["memory-management"]
 homepage = "https://github.com/gpabois/rs-pb-arena"
 [dependencies]
