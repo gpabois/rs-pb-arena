@@ -1,4 +1,4 @@
-use std::{alloc::{alloc, dealloc, Layout}, marker::PhantomData, ops::{Deref, DerefMut}, ptr::NonNull, sync::atomic::{AtomicI32, AtomicIsize}};
+use std::{alloc::{alloc, dealloc, Layout}, collections::HashSet, marker::PhantomData, ops::{Deref, DerefMut}, ptr::NonNull, sync::{atomic::{AtomicI32, AtomicIsize, AtomicUsize}, Arc, Mutex}};
 
 use pb_atomic_linked_list::AtomicLinkedList;
 
@@ -197,40 +197,74 @@ impl<T> ArenaBlock<T> {
 
 }
 
-/// A thread-safe arena allocator.
-#[derive(Clone)]
-pub struct Arena<T>{
+struct InnerArena<T> {
     blocks: AtomicLinkedList<ArenaBlock<T>>,
-    block_size: usize
+    block_size: usize,
+    free_block_register: Mutex<HashSet<ArenaBlockId>>,
+    free_block_count: AtomicUsize
+}
+
+/// A thread-safe arena allocator.
+pub struct Arena<T>(Arc<InnerArena<T>>);
+
+impl<T> Clone for Arena<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
 impl<T> Arena<T> {
     pub fn new(block_size: usize) -> Self {
-        Self {
+        let inner = InnerArena {
             blocks: AtomicLinkedList::new(),
-            block_size
-        }
+            block_size,
+            free_block_register: Mutex::new(HashSet::default()),
+            free_block_count: AtomicUsize::new(0)
+        };
+
+        Self(Arc::new(inner))
     }
 
     pub fn alloc(&mut self, data: T) -> ArenaId {
         // Find a suitable block with remaining space.
         // Optimisation can be done.
-        for (block_id, block) in self.blocks.iter().enumerate() {
-            unsafe {
-                if let Some((cell_id, mut uninit_cell)) = block.raw_alloc() {
-                    *uninit_cell.as_mut() = ArenaCell::new(data);
-                    return ArenaId {
-                        block_id: ArenaBlockId(block_id),
-                        cell_id
+        let free_block_count = self.0.free_block_count.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // We might find a free block to allocate our data.
+        if free_block_count > 0 {
+            if let Ok(mut register) = self.0.free_block_register.try_lock() {
+                let free_blocks = register.iter().map(|block_id| (*block_id, self.get_block(block_id)))
+                .filter(|(_, block)| block.is_some())
+                .map(|(block_id, block)| (block_id, block.unwrap()))
+                .collect::<Vec<_>>();
+                for (block_id, block) in free_blocks {
+                    unsafe {
+                        if let Some((cell_id, mut uninit_cell)) = block.raw_alloc() {
+                            *uninit_cell.as_mut() = ArenaCell::new(data);
+                            return ArenaId {
+                                block_id,
+                                cell_id
+                            }
+                        } else { // no more space !
+                            register.remove(&block_id);
+                            self.0.free_block_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
         }
 
+
         // We need to create a new block
-        let block = ArenaBlock::<T>::new(self.block_size);
+        let block = ArenaBlock::<T>::new(self.0.block_size);
         let cell_id = block.alloc(data).unwrap();
-        let block_id = ArenaBlockId(self.blocks.insert(block));
+        let block_id = ArenaBlockId(self.0.blocks.insert(block));
+
+        // Add it to the free block register
+        let mut register = self.0.free_block_register.lock().unwrap();
+        register.insert(block_id);
+        self.0.free_block_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
 
         return ArenaId { block_id, cell_id }
     }
@@ -248,7 +282,7 @@ impl<T> Arena<T> {
     }
 
     fn get_block(&self, block_id: &ArenaBlockId) -> Option<&ArenaBlock<T>> {
-        self.blocks.borrow(block_id.0)
+        self.0.blocks.borrow(block_id.0)
     }
 }
 
@@ -260,19 +294,19 @@ mod test {
 
     #[test]
     fn test_can_alloc_in_multiple_threads() {
-        let arena = Arena::<u32>::new(10);
+        let arena = Arena::<u32>::new(100);
         
         let mut arena_1 = arena.clone();
         let mut arena_2 = arena.clone();
 
         let j1 = thread::spawn(move || {
-            for i in 0..=1000 {
+            for i in 0..=100_000 {
                 arena_1.alloc(i);
             }
         });
 
         let j2 = thread::spawn(move || {
-            for i in 1001..=2000 {
+            for i in 0..=200_000 {
                 arena_2.alloc(i);
             }
         });
