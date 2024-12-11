@@ -198,12 +198,20 @@ impl<T> ArenaBlock<T> {
 }
 
 /// A thread-safe arena allocator.
+#[derive(Clone)]
 pub struct Arena<T>{
     blocks: AtomicLinkedList<ArenaBlock<T>>,
     block_size: usize
 }
 
 impl<T> Arena<T> {
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            blocks: AtomicLinkedList::new(),
+            block_size
+        }
+    }
+
     pub fn alloc(&mut self, data: T) -> ArenaId {
         // Find a suitable block with remaining space.
         // Optimisation can be done.
@@ -241,5 +249,37 @@ impl<T> Arena<T> {
 
     fn get_block(&self, block_id: &ArenaBlockId) -> Option<&ArenaBlock<T>> {
         self.blocks.borrow(block_id.0)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::thread;
+
+    use super::Arena;
+
+    #[test]
+    fn test_can_alloc_in_multiple_threads() {
+        let arena = Arena::<u32>::new(10);
+        
+        let mut arena_1 = arena.clone();
+        let mut arena_2 = arena.clone();
+
+        let j1 = thread::spawn(move || {
+            for i in 0..=1000 {
+                arena_1.alloc(i);
+            }
+        });
+
+        let j2 = thread::spawn(move || {
+            for i in 1001..=2000 {
+                arena_2.alloc(i);
+            }
+        });
+
+        j1.join().unwrap();
+        j2.join().unwrap();
+
+
     }
 }
