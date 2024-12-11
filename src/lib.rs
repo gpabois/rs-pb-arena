@@ -2,6 +2,8 @@
 
 use std::{alloc::{alloc, dealloc, Layout}, cell::UnsafeCell, ops::{Deref, DerefMut}, ptr::NonNull};
 
+pub mod thread;
+
 pub struct ArenaRefMut<'a, T: Sized> {
     wr_counter: &'a UnsafeCell<i32>,
     data: &'a UnsafeCell<T> 
@@ -58,7 +60,7 @@ impl<T: Sized> Drop for ArenaRef<'_, T> {
     }
 }
 
-pub struct ArenaCell<T: Sized> {
+struct ArenaCell<T: Sized> {
     wr_counter: UnsafeCell<i32>,
     data: UnsafeCell<T>
 }
@@ -100,7 +102,7 @@ impl<T: Sized> ArenaCell<T> {
     }
 }
 
-pub struct ArenaBlock<T: Sized> {
+struct ArenaBlock<T: Sized> {
     head: NonNull<ArenaCell<T>>,
     tail: NonNull<ArenaCell<T>>,
     last: Option<NonNull<ArenaCell<T>>>,

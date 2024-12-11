@@ -5,3 +5,12 @@ version = 3
 [[package]]
 name = "pb-arena"
 version = "0.1.1"
+dependencies = [
+ "pb-atomic-linked-list",
+]
+
+[[package]]
+name = "pb-atomic-linked-list"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa3db9f96b7f9ba54237e84b0d37c2433a162c0bd2dd02e9c96ba4cb7cb88982"

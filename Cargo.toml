@@ -8,3 +8,4 @@ keywords = ["arena", "tree", "graph"]
 categories = ["memory-management"]
 homepage = "https://github.com/gpabois/rs-pb-arena"
 [dependencies]
+pb-atomic-linked-list = "0.1.0"
