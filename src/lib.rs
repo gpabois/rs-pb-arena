@@ -2,7 +2,7 @@
 
 use std::{alloc::{alloc, dealloc, Layout}, cell::UnsafeCell, ops::{Deref, DerefMut}, ptr::NonNull};
 
-pub mod thread;
+pub mod sync;
 
 pub struct ArenaRefMut<'a, T: Sized> {
     wr_counter: &'a UnsafeCell<i32>,
