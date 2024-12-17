@@ -60,12 +60,12 @@ impl<T: Sized> Drop for ArenaRef<'_, T> {
     }
 }
 
-struct ArenaCell<T: Sized> {
+struct Entry<T: Sized> {
     wr_counter: UnsafeCell<i32>,
     data: UnsafeCell<T>
 }
 
-impl<T: Sized> ArenaCell<T> {
+impl<T: Sized> Entry<T> {
     pub fn new(data: T) -> Self {
         Self {
             wr_counter: UnsafeCell::new(0),
@@ -102,10 +102,10 @@ impl<T: Sized> ArenaCell<T> {
     }
 }
 
-struct ArenaBlock<T: Sized> {
-    head: NonNull<ArenaCell<T>>,
-    tail: NonNull<ArenaCell<T>>,
-    last: Option<NonNull<ArenaCell<T>>>,
+struct Bucket<T: Sized> {
+    head: NonNull<Entry<T>>,
+    tail: NonNull<Entry<T>>,
+    last: Option<NonNull<Entry<T>>>,
     layout: Layout
 }
 
@@ -119,9 +119,9 @@ impl From<usize> for ArenaCellId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct ArenaBlockId(usize);
+struct ArenaBucketId(usize);
 
-impl From<usize> for ArenaBlockId {
+impl From<usize> for ArenaBucketId {
     fn from(value: usize) -> Self {
         Self(value)
     }
@@ -129,7 +129,7 @@ impl From<usize> for ArenaBlockId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ArenaId {
-    block_id: ArenaBlockId,
+    block_id: ArenaBucketId,
     cell_id: ArenaCellId
 }
 
@@ -145,7 +145,7 @@ impl Ord for ArenaId {
 
 impl ArenaId {
     fn new<ABI, ACI>(block_id: ABI, cell_id: ACI) -> Self 
-    where ArenaBlockId: From<ABI>, ArenaCellId: From<ACI>
+    where ArenaBucketId: From<ABI>, ArenaCellId: From<ACI>
     {
         Self {block_id: block_id.into(), cell_id: cell_id.into()}
     }
@@ -155,7 +155,7 @@ impl ArenaId {
     }
 }
 
-impl<T: Sized> Drop for ArenaBlock<T> {
+impl<T: Sized> Drop for Bucket<T> {
     fn drop(&mut self) {
         unsafe {
             if let Some(last) = self.last {
@@ -173,11 +173,11 @@ impl<T: Sized> Drop for ArenaBlock<T> {
     }
 }
 
-impl<T: Sized> ArenaBlock<T> {
+impl<T: Sized> Bucket<T> {
     fn new(size: usize) -> Self {
         unsafe {
-            let layout = Layout::array::<ArenaCell<T>>(size).unwrap();
-            let head = NonNull::new(alloc(layout) as *mut ArenaCell<T>).unwrap();
+            let layout = Layout::array::<Entry<T>>(size).unwrap();
+            let head = NonNull::new(alloc(layout) as *mut Entry<T>).unwrap();
             let tail = head.add(size - 1);
             let last = None;
             Self {head, tail, last, layout}
@@ -211,7 +211,7 @@ impl<T: Sized> ArenaBlock<T> {
                 .map(|last| last.add(1))
                 .unwrap_or_else(|| self.head);
 
-            *last.as_mut() = ArenaCell::new(value);
+            *last.as_mut() = Entry::new(value);
             self.last = Some(last);
             return ArenaCellId(self.len() - 1)
         }
@@ -227,7 +227,7 @@ impl<T: Sized> ArenaBlock<T> {
     }
 
     // Returns the cell by its id.
-    fn get_cell(&self, cell_id: ArenaCellId) -> Option<&ArenaCell<T>> {
+    fn get_cell(&self, cell_id: ArenaCellId) -> Option<&Entry<T>> {
         self.last
         .map(|last| {
             unsafe {
@@ -292,7 +292,7 @@ impl<'a, T: Sized> Iterator for ArenaIter<'a, T> {
 // ```
 //
 pub struct Arena<T: Sized> {
-    blocks: Vec<ArenaBlock<T>>,
+    blocks: Vec<Bucket<T>>,
     block_size: usize
 }
 
@@ -310,12 +310,12 @@ impl<T: Sized> Arena<T> {
 
     pub fn borrow(&self, id: ArenaId) -> Option<ArenaRef<'_, T>> {
         self.get_cell(id)
-        .map(ArenaCell::borrow)
+        .map(Entry::borrow)
         .flatten()
     }
     
     pub fn borrow_mut(&self, id: ArenaId) -> Option<ArenaRefMut<'_, T>> {
-        self.get_cell(id).map(ArenaCell::borrow_mut).flatten()
+        self.get_cell(id).map(Entry::borrow_mut).flatten()
     }
 
     pub fn alloc(&mut self, data: T) -> ArenaId {
@@ -324,10 +324,10 @@ impl<T: Sized> Arena<T> {
             return ArenaId {block_id, cell_id}
         }
 
-        let mut block = ArenaBlock::<T>::new(self.block_size);
+        let mut block = Bucket::<T>::new(self.block_size);
         let cell_id = block.alloc(data);
         self.blocks.push(block);
-        let block_id = ArenaBlockId(self.blocks.len() - 1);
+        let block_id = ArenaBucketId(self.blocks.len() - 1);
 
         return ArenaId { block_id, cell_id }
     }
@@ -340,19 +340,19 @@ impl<T: Sized> Arena<T> {
             .unwrap_or_default()
     }
    
-    fn get_cell(&self, id: ArenaId) -> Option<&ArenaCell<T>> {
+    fn get_cell(&self, id: ArenaId) -> Option<&Entry<T>> {
         self.blocks
         .get(id.block_id.0)
         .map(|block| block.get_cell(id.cell_id))
         .flatten()
     }
     
-    fn find_free_block(&mut self) -> Option<(ArenaBlockId, &mut ArenaBlock<T>)> {
+    fn find_free_block(&mut self) -> Option<(ArenaBucketId, &mut Bucket<T>)> {
         self.blocks
             .iter_mut()
             .enumerate()
             .find(|(_, block)| !block.is_full())
-            .map(|(block_id, block)| (ArenaBlockId(block_id), block))
+            .map(|(block_id, block)| (ArenaBucketId(block_id), block))
     }
 
     fn first_id(&self) -> Option<ArenaId> {

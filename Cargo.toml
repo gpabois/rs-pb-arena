@@ -1,6 +1,6 @@
 [package]
 name = "pb-arena"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license-file = "LICENSE.txt"
 description = "Yet another arena allocator for graph based operations"
@@ -8,4 +8,5 @@ keywords = ["arena", "tree", "graph"]
 categories = ["memory-management"]
 homepage = "https://github.com/gpabois/rs-pb-arena"
 [dependencies]
+pb-atomic-hash-map = "0.1.0"
 pb-atomic-linked-list = "0.1.0"
