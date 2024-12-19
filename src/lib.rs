@@ -1,278 +1,330 @@
 //! ID based arena for graph operations.
 
-use std::{alloc::{alloc, dealloc, Layout}, cell::UnsafeCell, ops::{Deref, DerefMut}, ptr::NonNull};
+use std::{alloc::{alloc, dealloc, Layout}, cell::UnsafeCell, iter::Enumerate, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, ptr::NonNull};
 
 pub mod sync;
 
-pub struct ArenaRefMut<'a, T: Sized> {
-    wr_counter: &'a UnsafeCell<i32>,
-    data: &'a UnsafeCell<T> 
+type ArenaPeriod = usize;
+type ArenaEntryId = usize;
+type ArenaBucketId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub struct ArenaId {
+    pub(crate) period: Option<usize>,
+    pub(crate) bucket: usize,
+    pub(crate) entry: usize
+}
+impl Ord for ArenaId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.bucket != other.bucket {
+            return self.bucket.cmp(&other.bucket);
+        }
+
+        return self.entry.cmp(&other.entry);
+    }
+}
+impl ArenaId {
+    fn new_with_period(bucket: ArenaBucketId, entry: ArenaEntryId, period: ArenaPeriod) -> Self {
+        Self {bucket, entry, period: Some(period)}
+    }
 }
 
-impl<T: Sized> Deref for ArenaRefMut<'_, T> {
+pub struct ArenaMutRef<'a, T: Sized> {
+    _phantom: PhantomData<&'a ()>,
+    ptr: NonNull<Entry<T>>
+}
+impl<T: Sized> Deref for ArenaMutRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         unsafe {
-            self.data.get().as_ref().unwrap()
+            self.ptr.as_ref().data.get().as_ref().unwrap().assume_init_ref()
         }
     }
 }
-
-impl<T: Sized> DerefMut for ArenaRefMut<'_, T> {
+impl<T: Sized> DerefMut for ArenaMutRef<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            self.data.get().as_mut().unwrap()
+            self.ptr.as_mut().data.get_mut().assume_init_mut()
         }
     }
 }
-
-
-impl<T: Sized> Drop for ArenaRefMut<'_, T> {
+impl<T: Sized> Drop for ArenaMutRef<'_, T> {
     fn drop(&mut self) {
         unsafe {
-            *self.wr_counter.get() += 1;
+            *self.ptr.as_mut().wr_counter.get_mut() += 1;
         }
     }
 }
 
-
 pub struct ArenaRef<'a, T: Sized> {
-    wr_counter: &'a UnsafeCell<i32>,
-    data: &'a UnsafeCell<T>
+    _phantom: PhantomData<&'a ()>,
+    ptr: NonNull<Entry<T>>
 }
-
 impl<T: Sized> Deref for ArenaRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         unsafe {
-            self.data.get().as_ref().unwrap()
+            self.ptr.as_ref().data.get().as_ref().unwrap().assume_init_ref()
         }
     }
 }
-
 impl<T: Sized> Drop for ArenaRef<'_, T> {
     fn drop(&mut self) {
         unsafe {
-            *self.wr_counter.get() -= 1;
+            *self.ptr.as_mut().wr_counter.get_mut() -= 1;
         }
     }
 }
 
 struct Entry<T: Sized> {
     wr_counter: UnsafeCell<i32>,
-    data: UnsafeCell<T>
+    period: UnsafeCell<usize>,
+    free: UnsafeCell<bool>,
+    data: UnsafeCell<MaybeUninit<T>>
+}
+
+impl<T: Sized> Drop for Entry<T> {
+    fn drop(&mut self) {
+        if !self.is_free() {
+            unsafe {
+                self.data.get_mut().assume_init_drop();
+            }
+        }
+    }
 }
 
 impl<T: Sized> Entry<T> {
-    pub fn new(data: T) -> Self {
+    pub unsafe fn new() -> Self {
         Self {
             wr_counter: UnsafeCell::new(0),
-            data: UnsafeCell::new(data)
+            period: UnsafeCell::new(0),
+            free: UnsafeCell::new(true),
+            data: UnsafeCell::new(MaybeUninit::<T>::uninit())
         }
     }
-    
 
-    pub fn borrow(&self) -> Option<ArenaRef<'_, T>> {
+    fn borrow_mut<'a>(ptr: NonNull<Self>) -> Option<ArenaMutRef<'a, T>> {
         unsafe {
-            if *(self.wr_counter.get()) < 0 {
-                return None
-            }
-
-            *self.wr_counter.get() += 1;
-        }
-
-        return Some(ArenaRef {
-            wr_counter: &self.wr_counter,
-            data: &self.data
-        })
+            let entry = ptr.as_ptr().as_mut().unwrap();
+            let wr_counter = entry.wr_counter.get_mut();
+            (*wr_counter == 0).then(|| {
+                *wr_counter -= 1;
+                ArenaMutRef {_phantom: PhantomData, ptr}
+            })
+        }    
     }
 
-    pub fn borrow_mut(&self) -> Option<ArenaRefMut<'_, T>> {
+    fn borrow<'a>(ptr: NonNull<Self>) -> Option<ArenaRef<'a, T>> {
         unsafe {
-            if *(self.wr_counter.get()) != 0 {
-                return None
-            }
-
-            *self.wr_counter.get() -= 1;
+            let entry = ptr.as_ptr().as_mut().unwrap();
+            let wr_counter = entry.wr_counter.get_mut();
+            (*wr_counter >= 0).then(|| {
+                *wr_counter += 1;
+                ArenaRef {_phantom: PhantomData, ptr}
+            })
         }
+    }
 
-        Some(ArenaRefMut { wr_counter: &self.wr_counter, data: &self.data })
+    pub fn is_free(&self) -> bool {
+        unsafe {
+            *self.free.get().as_ref().unwrap()
+        }
+    }
+
+    pub fn write(&mut self, data: T) -> Result<ArenaPeriod, T> {
+        unsafe {
+            if self.is_free() {
+                self.data.get().as_mut().unwrap().write(data);
+                let period = self.period.get().as_mut().unwrap();
+                *self.free.get_mut() = false;
+                *period += 1;
+                Ok(*period)
+            } else {
+                Err(data)
+            }
+        }
     }
 }
 
 struct Bucket<T: Sized> {
-    head: NonNull<Entry<T>>,
-    tail: NonNull<Entry<T>>,
-    last: Option<NonNull<Entry<T>>>,
+    entries: NonNull<[Entry<T>]>,
+    tail: Option<usize>,
+    length: usize,
     layout: Layout
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct ArenaCellId(usize);
-
-impl From<usize> for ArenaCellId {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct ArenaBucketId(usize);
-
-impl From<usize> for ArenaBucketId {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
-pub struct ArenaId {
-    block_id: ArenaBucketId,
-    cell_id: ArenaCellId
-}
-
-impl Ord for ArenaId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.block_id != other.block_id {
-            return self.block_id.cmp(&other.block_id);
-        }
-
-        return self.cell_id.cmp(&other.cell_id);
-    }
-}
-
-impl ArenaId {
-    fn new<ABI, ACI>(block_id: ABI, cell_id: ACI) -> Self 
-    where ArenaBucketId: From<ABI>, ArenaCellId: From<ACI>
-    {
-        Self {block_id: block_id.into(), cell_id: cell_id.into()}
-    }
-    
-    fn next_block(&self) -> Self {
-        Self::new(self.block_id.0 + 1, 0)
-    }
-}
-
 impl<T: Sized> Drop for Bucket<T> {
     fn drop(&mut self) {
         unsafe {
-            if let Some(last) = self.last {
-                let mut cursor = self.head;
-                
-                while cursor <= last {
-                    cursor.drop_in_place();
-                    cursor = cursor.add(1);
-                }
-
+            for ptr in self.iter_entries_ptr() {
+                ptr.drop_in_place();
             }
 
-            dealloc(self.head.cast::<u8>().as_ptr(), self.layout);
+            dealloc(self.entries.cast::<u8>().as_ptr(), self.layout);
         }
     }
 }
-
 impl<T: Sized> Bucket<T> {
     fn new(size: usize) -> Self {
         unsafe {
             let layout = Layout::array::<Entry<T>>(size).unwrap();
-            let head = NonNull::new(alloc(layout) as *mut Entry<T>).unwrap();
-            let tail = head.add(size - 1);
-            let last = None;
-            Self {head, tail, last, layout}
-        }
-    }
-
-    fn first_id(&self) -> Option<ArenaCellId> {
-        if self.len() == 0 {
-            return None
-        }
-
-        return Some(ArenaCellId(0))
-    }
-
-    fn next_id(&self, id: ArenaCellId) -> Option<ArenaCellId> {
-        self.last.map(|last| {
-            unsafe {
-                let cursor = self.head.add(id.0 + 1);
-                (cursor <= last).then(|| ArenaCellId(id.0 + 1))
+            let raw = alloc(layout).cast::<MaybeUninit<Entry<T>>>();
+            let slice_raw = std::ptr::slice_from_raw_parts_mut(raw, size);
+            let mut maybe_uninnit_entries = NonNull::new(slice_raw).unwrap();
+            
+            for entry in maybe_uninnit_entries.as_mut().iter_mut() {
+                entry.write(Entry::new());
             }
-        }).flatten()
+
+            let entries = std::mem::transmute(maybe_uninnit_entries);
+
+            Self {entries, tail: None, layout, length: 0}
+        }
     }
 
-    fn alloc(&mut self, value: T) -> ArenaCellId {
+    unsafe fn iter_entries_ptr(&self) -> impl Iterator<Item=NonNull<Entry<T>>> + '_ {
+        (0..self.len())
+        .map(|entry| unsafe {
+            self.get_entry_ptr(&entry)
+        })
+        .flatten()
+    }
+
+    fn alloc(&mut self, data: T) -> Result<(ArenaPeriod, ArenaEntryId), T> {
         if self.is_full() {
-            panic!("block is full")
+            return Err(data);
         }        
 
+        let new_tail = self.tail.map(|tail| {
+            tail + 1
+        }).unwrap_or(0);
+
         unsafe {
-            let mut last = self.last
-                .map(|last| last.add(1))
-                .unwrap_or_else(|| self.head);
-
-            *last.as_mut() = Entry::new(value);
-            self.last = Some(last);
-            return ArenaCellId(self.len() - 1)
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.last.map(|last| {
-            unsafe {
-                let offset: usize = last.offset_from(self.head).try_into().unwrap();
-                offset + 1
-            }     
-        }).unwrap_or_default()       
-    }
-
-    // Returns the cell by its id.
-    fn get_cell(&self, cell_id: ArenaCellId) -> Option<&Entry<T>> {
-        self.last
-        .map(|last| {
-            unsafe {
-                let ptr = self.head.add(cell_id.0);
-                
-                (ptr <= last && ptr >= self.head)
-                .then(|| ptr.as_ref())
+            if let Some(mut entry) = self.get_entry_ptr_unchecked(&new_tail) {
+                entry
+                .as_mut()
+                .write(data)
+                .map(|period| (period, new_tail))
+                .inspect(|_| {
+                    self.tail = Some(new_tail);
+                    self.length += 1;
+                })
+            } else {
+                Err(data)
             }
-        }).flatten()
+        }
+    }
+    
+    fn len(&self) -> usize {
+        self.length    
     }
 
-    pub fn is_full(&self) -> bool {
-        self.last
-            .map(|last| last >= self.tail)
-            .unwrap_or_else(|| false)
+    unsafe fn get_entry_ptr(&self, entry: &ArenaEntryId) -> Option<NonNull<Entry<T>>> {
+        self
+        .get_entry_ptr_unchecked(entry)
+        .filter(|ptr| ptr.as_ref().is_free() == false)
+    }
+
+    // Returns the entry by its id.
+    unsafe fn get_entry_ptr_unchecked(&self, entry: &ArenaEntryId) -> Option<NonNull<Entry<T>>> {
+        unsafe {
+            self.entries
+                .as_ptr().as_ref().unwrap()
+                .get(*entry)
+                .map(|entry_ref| std::ptr::from_ref(entry_ref) as *mut Entry<T>)
+                .map(NonNull::new)
+                .flatten()
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        unsafe {
+            self.entries.as_ref().len()
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len() >= self.capacity()
     }
 }
 
+struct BucketIter<'a, T>(std::slice::Iter<'a, Bucket<T>>);
+impl<'a, T> Iterator for BucketIter<'a, T> {
+    type Item = &'a Bucket<T>;
 
-pub struct ArenaIter<'a, T: Sized> {
-    arena: &'a Arena<T>,
-    id: Option<ArenaId>
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
 }
 
-impl<'a, T: Sized> ArenaIter<'a, T> {
-    pub fn new(arena: &'a Arena<T>) -> Self {
-        Self {
-            arena,
-            id: None
+struct BucketEntryIter<'a, T>(std::slice::Iter<'a, Entry<T>>);
+impl<'a, T> BucketEntryIter<'a, T> {
+    pub fn new(bucket: &'a Bucket<T>) -> Self {
+        unsafe {
+            Self(bucket.entries.as_ref().iter())
         }
     }
 }
+impl<'a, T> Iterator for BucketEntryIter<'a, T> {
+    type Item = &'a Entry<T>;
 
-impl<'a, T: Sized> Iterator for ArenaIter<'a, T> {
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+pub struct Iter<'a, T: Sized> {
+    buckets: Enumerate<BucketIter<'a, T>>,
+    bucket_id: usize,
+    entries: Option<Enumerate<BucketEntryIter<'a, T>>>,
+}
+
+
+impl<'a, T: Sized> Iter<'a, T> {
+    pub fn new(arena: &'a Arena<T>) -> Self {
+        let buckets = arena.iter_buckets().enumerate();
+        Self {
+            buckets,
+            entries: None,
+            bucket_id: 0,
+        }
+    }
+
+    pub fn next_bucket_entry(&mut self) -> Option<ArenaId> {
+        if let Some(entries) = &mut self.entries {
+            while let Some((entry_id, entry)) = entries.next() {
+                if entry.is_free() == false {
+                    return Some(ArenaId::new_with_period(
+                        self.bucket_id, 
+                        entry_id, 
+                        unsafe {*entry.period.get().as_ref().unwrap()}
+                    ))
+                }
+            }
+            self.entries = None;
+        }
+
+        None
+    }
+}
+
+impl<'a, T: Sized> Iterator for Iter<'a, T> {
     type Item = ArenaId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.id.is_none() {
-            self.id = self.arena.first_id();
-            return self.id
+        if let Some(entry) = self.next_bucket_entry() {
+            return Some(entry)
         }
 
-        let id = self.id.unwrap();
-        self.id = self.arena.next_id(id);
-        return self.id
+        if let Some((bucket_id, bucket)) = self.buckets.next() {
+            self.bucket_id = bucket_id;
+            self.entries = Some(BucketEntryIter::new(bucket).enumerate());
+        } else {
+            return None
+        }
+
+        return self.next_bucket_entry()
     }
 }
 
@@ -292,102 +344,78 @@ impl<'a, T: Sized> Iterator for ArenaIter<'a, T> {
 // ```
 //
 pub struct Arena<T: Sized> {
-    blocks: Vec<Bucket<T>>,
-    block_size: usize
+    buckets: Vec<Bucket<T>>,
+    bucket_size: usize
 }
 
 impl<T: Sized> Arena<T> {
     pub fn new(block_size: usize) -> Self {
         Self {
-            blocks: Vec::default(),
-            block_size
+            buckets: Vec::default(),
+            bucket_size: block_size
         }
     }
 
-    pub fn iter(&self) -> ArenaIter<'_, T> {
-        ArenaIter::new(self)
+    fn iter_buckets(&self) -> BucketIter<'_, T>{
+        BucketIter(self.buckets.iter())
     }
 
-    pub fn borrow(&self, id: ArenaId) -> Option<ArenaRef<'_, T>> {
-        self.get_cell(id)
-        .map(Entry::borrow)
-        .flatten()
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter::new(self)
+    }
+
+    pub fn borrow(&self, id: &ArenaId) -> Option<ArenaRef<'_, T>> {
+        unsafe {
+            self.get_entry_ptr(id)
+            .map(Entry::borrow)
+            .flatten()
+        }
     }
     
-    pub fn borrow_mut(&self, id: ArenaId) -> Option<ArenaRefMut<'_, T>> {
-        self.get_cell(id).map(Entry::borrow_mut).flatten()
+    pub fn borrow_mut(&self, id: &ArenaId) -> Option<ArenaMutRef<'_, T>> {
+        unsafe {
+            self.get_entry_ptr(id)
+            .map(Entry::borrow_mut)
+            .flatten()
+        }
     }
 
-    pub fn alloc(&mut self, data: T) -> ArenaId {
-        if let Some((block_id, block)) = self.find_free_block() {
-            let cell_id: ArenaCellId = block.alloc(data);
-            return ArenaId {block_id, cell_id}
+    pub fn alloc(&mut self, mut data: T) -> ArenaId {
+        if let Some((bucket_id, bucket)) = self.find_free_bucket() {
+            match bucket.alloc(data) {
+                Ok((period, entry)) => return ArenaId::new_with_period(bucket_id, entry, period),
+                Err(dat) => data = dat
+            };
         }
 
-        let mut block = Bucket::<T>::new(self.block_size);
-        let cell_id = block.alloc(data);
-        self.blocks.push(block);
-        let block_id = ArenaBucketId(self.blocks.len() - 1);
+        let mut bucket = Bucket::<T>::new(self.bucket_size);
+        let (period, entry) = bucket.alloc(data).ok().unwrap();
+        self.buckets.push(bucket);
+        let block_id = self.buckets.len() - 1;
 
-        return ArenaId { block_id, cell_id }
+        return ArenaId::new_with_period(block_id, entry, period)
     }
 
     pub fn len(&self) -> usize {
-        self.blocks
+        self.buckets
             .iter()
             .map(|block| block.len())
             .reduce(std::ops::Add::add)
             .unwrap_or_default()
     }
    
-    fn get_cell(&self, id: ArenaId) -> Option<&Entry<T>> {
-        self.blocks
-        .get(id.block_id.0)
-        .map(|block| block.get_cell(id.cell_id))
+    unsafe fn get_entry_ptr(&self, id: &ArenaId) -> Option<NonNull<Entry<T>>> {
+        self.buckets
+        .get(id.bucket)
+        .map(|block| block.get_entry_ptr_unchecked(&id.entry))
         .flatten()
     }
     
-    fn find_free_block(&mut self) -> Option<(ArenaBucketId, &mut Bucket<T>)> {
-        self.blocks
+    fn find_free_bucket(&mut self) -> Option<(ArenaBucketId, &mut Bucket<T>)> {
+        self.buckets
             .iter_mut()
             .enumerate()
             .find(|(_, block)| !block.is_full())
-            .map(|(block_id, block)| (ArenaBucketId(block_id), block))
-    }
-
-    fn first_id(&self) -> Option<ArenaId> {
-        self.blocks
-            .get(0)
-            .map(|block| 
-                block.first_id().map(|cell_id| ArenaId::new(0, cell_id))
-            )
-            .flatten()
-    }
-
-    fn next_block_id(&self, id: ArenaId) -> Option<ArenaId> {
-        self.blocks
-            .get(id.block_id.0 + 1)
-            .map(|block| 
-                block.first_id()
-                    .map(|cell_id| ArenaId::new(
-                        id.block_id.0 + 1,
-                        cell_id
-                    ))
-            )
-            .flatten()
-    }
-
-    fn next_id(&self, id: ArenaId) -> Option<ArenaId> {
-        self.blocks
-        .get(id.block_id.0)
-        .map(|block| {
-            block
-            .next_id(id.cell_id)
-            .map(|cell_id| ArenaId::new(id.block_id, cell_id))
-        })
-        .flatten()
-        .or_else(|| self.next_block_id(id))
-        
     }
 }
 
@@ -400,11 +428,8 @@ mod tests {
         let mut arena = Arena::<u32>::new(1);
         let id = arena.alloc(10);
 
-        assert_eq!(arena.len(), 1);
-        assert!(arena.get_cell(ArenaId::new(0, 0)).is_some());
-
-        let cell = arena.get_cell(id).unwrap();
-        assert_eq!(*cell.borrow().unwrap(), 10);
+        let borrowed = arena.borrow(&id).unwrap();
+        assert_eq!(*borrowed, 10);
     }
 
     #[test]
@@ -417,26 +442,24 @@ mod tests {
 
         assert_eq!(arena.len(), 4);
 
-        let cell = arena.get_cell(id).unwrap();
-        assert_eq!(*cell.borrow().unwrap(), 3);
+        let borrowed = arena.borrow(&id).unwrap();
+        assert_eq!(*borrowed, 3);
     }
 
     #[test]
     fn test_iter() {
         let mut arena = Arena::<u32>::new(2);
+        
         arena.alloc(1);
         arena.alloc(2);
         arena.alloc(3);
         arena.alloc(4);  
 
-        assert_eq!(arena.next_block_id(ArenaId::new(0,1)), Some(ArenaId::new(1,0)));
-        assert_eq!(arena.next_id(ArenaId::new(0,1)), Some(ArenaId::new(1,0)));
-
         let expected_ids = vec![
-            ArenaId::new(0, 0),
-            ArenaId::new(0, 1),
-            ArenaId::new(1, 0),
-            ArenaId::new(1, 1)
+            ArenaId::new_with_period(0, 0, 1),
+            ArenaId::new_with_period(0, 1, 1),
+            ArenaId::new_with_period(1, 0, 1),
+            ArenaId::new_with_period(1, 1, 1)
         ];
 
         let ids = arena.iter().collect::<Vec<_>>();
@@ -448,8 +471,8 @@ mod tests {
         let mut arena = Arena::<u32>::new(1);
         let id = arena.alloc(10);
 
-        let borrow_1 = arena.borrow(id);
-        let borrow_2 = arena.borrow(id);
+        let borrow_1 = arena.borrow(&id);
+        let borrow_2 = arena.borrow(&id);
 
         assert!(borrow_1.is_some());
         assert!(borrow_2.is_some())
@@ -460,8 +483,8 @@ mod tests {
         let mut arena = Arena::<u32>::new(1);
         let id = arena.alloc(10);
 
-        let _ref = arena.borrow(id).unwrap();
-        assert_eq!(arena.borrow_mut(id).is_none(), true); // cannot mut borrow multiple times.
+        let _ref = arena.borrow(&id).unwrap();
+        assert_eq!(arena.borrow_mut(&id).is_none(), true); // cannot mut borrow multiple times.
     }
 
     #[test]
@@ -469,8 +492,8 @@ mod tests {
         let mut arena = Arena::<u32>::new(1);
         let id = arena.alloc(10);
 
-        let _mut_ref = arena.borrow_mut(id).unwrap();
-        assert_eq!(arena.borrow_mut(id).is_none(), true); // cannot mut borrow multiple times.
+        let _mut_ref = arena.borrow_mut(&id).unwrap();
+        assert_eq!(arena.borrow_mut(&id).is_none(), true); // cannot mut borrow multiple times.
     }
 
     #[test]
@@ -479,8 +502,8 @@ mod tests {
         let id_1 = arena.alloc(10);
         let id_2 = arena.alloc(20);
 
-        let ref_1 = arena.borrow_mut(id_1).unwrap();
-        let ref_2 = arena.borrow_mut(id_2).unwrap();
+        let ref_1 = arena.borrow_mut(&id_1).unwrap();
+        let ref_2 = arena.borrow_mut(&id_2).unwrap();
 
         assert_eq!(*ref_1, 10);
         assert_eq!(*ref_2, 20);
@@ -505,7 +528,7 @@ mod tests {
 
         let id = arena.alloc(DropCanary { flag: Some(&mut flag)});
 
-        assert_eq!(arena.borrow(id).unwrap().flag, Some(&mut false));
+        assert_eq!(arena.borrow(&id).unwrap().flag, Some(&mut false));
         drop(arena);
 
         assert_eq!(flag, true);
